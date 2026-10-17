@@ -1,0 +1,7 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+*.launch
+# host test binaries
+Tests/*.exe
+Tests/t
