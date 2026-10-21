@@ -11,7 +11,7 @@ forwards telecommands from the ground station back to the FC.
             USART3 921600                 UART5 115200   E22-900T22D LoRa   1 Hz
  FC  <------------------------>  RF board <------------> 
    telemetry 10 Hz, $IMG lines            USART2 115200  XBee Pro           5 Hz + image lines
-   <- telecommands                        UART4  921600  EC200U GSM         MQTT 15 Hz + image lines + SMS / 60 s
+   <- telecommands                        UART4  115200  EC200U GSM         MQTT 15 Hz + image lines + SMS / 60 s
 ```
 
 ## Pin assignment
@@ -42,11 +42,11 @@ control is done in software on PA5/PA6).
 | UART   | Peripheral        | Baud    | RX method                          |
 |--------|-------------------|---------|------------------------------------|
 | USART3 | Flight computer   | 921600  | circular DMA + IDLE line           |
-| UART4  | EC200U GSM        | 921600  | interrupt, IDLE line, 128 B buffer |
+| UART4  | EC200U GSM        | 115200  | interrupt, IDLE line, 128 B buffer |
 | USART2 | XBee Pro          | 115200  | interrupt, IDLE line               |
 | UART5  | E22-900T22D LoRa  | 115200  | interrupt, IDLE line               |
 
-The FC and the EC200U must already be configured for 921600; the firmware does not change
+The FC must already be configured for 921600 and the EC200U for 115200; the firmware does not change
 module baud rates.
 
 ## Tasks (`Core/Src/freertos.c`)
