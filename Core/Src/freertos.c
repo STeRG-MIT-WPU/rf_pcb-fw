@@ -47,6 +47,8 @@
 #define GSM_BOOT_MS         5000    /* EC200U power-up before the first AT */
 #define GSM_PUB_TIMEOUT_MS  200     /* wait for +QMTPUBEX; a slow ack is not a link failure */
 #define GSM_MAX_FAILS       8       /* consecutive publish failures -> reconnect */
+#define MQTT_RETRY_MS       3000    /* pause between broker connect attempts (never gives up) */
+#define MQTT_RETRIES_PER_NET 5      /* after this many broker misses, redo the network bring-up as well */
 #define SMS_TIMEOUT_MS      8000    /* +CMGS can take seconds; publishing pauses meanwhile */
 #define LORA_CHUNK          240     /* E22 UART sub-packet: send 240, pause, send the rest (rf_txtest build) */
 #define LORA_CHUNK_GAP_MS   500
@@ -430,14 +432,23 @@ static bool gsm_connect(void)
     snprintf(cmd, sizeof cmd, "AT+QICSGP=1,1,\"%s\",\"\",\"\",1\r\n", GSM_APN);
     if (!gsm_cmd(cmd, "OK", 2000)) return false;
     gsm_cmd("AT+QIACT=1\r\n", "OK", 30000);                     /* ERROR if already active: fine */
+    return true;
+}
+
+/* Broker stage only; retried on its own by gsm_task until it succeeds.
+ * The modem answers a failed open/connect quickly with a non-zero result, so wait for the
+ * result line itself, not for the success value, and do not sit out the full timeout. */
+static bool mqtt_connect(void)
+{
+    char cmd[128];
     gsm_cmd("AT+QMTCLOSE=0\r\n", "OK", 2000);                   /* drop a stale session */
     gsm_cmd("AT+QMTCFG=\"version\",0,4\r\n", "OK", 1000);       /* MQTT 3.1.1 */
     snprintf(cmd, sizeof cmd, "AT+QMTOPEN=0,\"%s\",%d\r\n", MQTT_BROKER, MQTT_PORT);
-    if (!gsm_cmd(cmd, "+QMTOPEN: 0,0", 30000)) return false;
+    if (!gsm_cmd(cmd, "+QMTOPEN: 0,", 30000) || !gsm_has("+QMTOPEN: 0,0")) return false;
     snprintf(cmd, sizeof cmd, "AT+QMTCONN=0,\"%s\"\r\n", MQTT_CLIENT_ID);
-    if (!gsm_cmd(cmd, "+QMTCONN: 0,0,0", 15000)) return false;
+    if (!gsm_cmd(cmd, "+QMTCONN: 0,", 15000) || !gsm_has("+QMTCONN: 0,0,0")) return false;
     snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,1,\"%s\",0\r\n", MQTT_TOPIC_CMD);
-    return gsm_cmd(cmd, "+QMTSUB: 0,1,0", 15000);
+    return gsm_cmd(cmd, "+QMTSUB: 0,1,", 15000) && gsm_has("+QMTSUB: 0,1,0");
 }
 
 /* false only when the modem refuses the publish (no ">" prompt, ERROR, or an explicit
@@ -472,7 +483,7 @@ static void gsm_task(void *arg)
     const img_line_t *l;
     uint32_t count = 0, next = 0, last_sms = 0;
     int fails = 0;
-    bool online = false;
+    bool online = false, net_up = false;
 
     gsm_task_h = osThreadGetId();
     HAL_UARTEx_ReceiveToIdle_IT(&huart4, gsm_rx, sizeof gsm_rx);
@@ -481,8 +492,13 @@ static void gsm_task(void *arg)
     for (;;) {
         if (!online) {
             img_r_gsm = img_w;                 /* offline: do not hold the image ring (and XBee) back */
-            online = gsm_connect();
-            if (!online) { osDelay(5000); continue; }
+            if (!net_up) net_up = gsm_connect();
+            online = net_up && mqtt_connect();
+            if (!online) {                     /* keep trying the broker; every Nth miss redo the modem bring-up too */
+                if (++fails % MQTT_RETRIES_PER_NET == 0) net_up = false;
+                osDelay(MQTT_RETRY_MS);
+                continue;
+            }
             fails = 0;
             next = last_sms = osKernelGetTickCount();
         }
