@@ -48,7 +48,7 @@ int main(void)
     assert(img_peek(&img_r_xbee) == NULL && img_peek(&img_r_gsm) == NULL);
 
     /* 2. telemetry is untouched by the image path */
-    fc_handle_line("$,011,1,1,0|0|0,0|0|0,0|0|0,0|0|0,0,0,0,0|0|0,0,0,0,0,0,0|0,0,0,0,0,0,#");
+    fc_handle_line("$,011,1,1,0|0|0,0|0|0,0|0|0,0|0|0,0,0,0,0|0|0,0,0,0,0,0,0|0,0,0,0,0,0,0,0,#");
     assert(fc_valid && fc_tlm.packet_count == 1 && img_w == 4);
 
     /* 3. readers stall: ring fills, image gets FAIL at once, nothing lost from the ring */
@@ -70,6 +70,20 @@ int main(void)
     drain(&img_r_xbee, 3); drain(&img_r_gsm, 3); ack_poll();
     assert(strcmp(fc_out, "IMGACK,9,OK\r\n") == 0);
 
+    /* 5. a full-size line (1024 raw bytes -> 1368 base64, ~1400 chars) fits; one over IMG_LINE_MAX is dropped */
+    {
+        static char big[IMG_LINE_MAX + 8];
+        int h = snprintf(big, sizeof big, "$IMG,65535,9999,9999,1024,");
+        memset(big + h, 'A', 1368); strcpy(big + h + 1368, "*7F");
+        assert(strlen(big) + 2 <= IMG_LINE_MAX);
+        img_r_xbee = img_r_gsm = img_w;
+        push("$IMGSTART,%d,1024,%d*00", 10, 1);
+        fc_handle_line(big);
+        assert(!img_drop && img_ring[(img_w - 1) % IMG_RING].len == strlen(big) + 2);
+        memset(big + h, 'A', IMG_LINE_MAX - 1); big[IMG_LINE_MAX - 1] = 0;     /* IMG_LINE_MAX - 1 chars + CRLF > max */
+        fc_handle_line(big);
+        assert(img_drop);
+    }
     puts("img ring ok");
     return 0;
 }

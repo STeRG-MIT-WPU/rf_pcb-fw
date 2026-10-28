@@ -47,7 +47,9 @@ int tlm_parse(const char *line, FC_tlm *out)
     F(r.volt, ',');
     F(r.batt_pct, ',');
     I(r.state, ',');
-    r.e_flag = strtoul(p, &end, 16);
+    NUM(r.e_flag, strtoul(p, &end, 16), ',');
+    I(r.prop_deploy, ',');
+    r.rw_status = (int)strtol(p, &end, 10);
     if (end[0] != ',' || end[1] != '#') return -1;
 
     *out = r;
@@ -58,7 +60,7 @@ int tlm_format(const FC_tlm *t, char *out, size_t n)
 {
     int len = snprintf(out, n,
         "$,%s,%lu,%lu,%.2f|%.2f|%.2f,%.2f|%.2f|%.2f,%.2f|%.2f|%.2f,%.2f|%.2f|%.2f,"
-        "%.2f,%.2f,%.2f,%.2f|%.2f|%.2f,%.1f,%.6f,%.6f,%.1f,%d,%.2f|%.2f,%.2f,%.2f,%.1f,%d,%lX,#\r\n",
+        "%.2f,%.2f,%.2f,%.2f|%.2f|%.2f,%.1f,%.6f,%.6f,%.1f,%d,%.2f|%.2f,%.2f,%.2f,%.1f,%d,%lX,%d,%d,#\r\n",
         t->team_id, (unsigned long)t->mission_time, (unsigned long)t->packet_count,
         t->acc[0], t->acc[1], t->acc[2],
         t->gyr[0], t->gyr[1], t->gyr[2],
@@ -68,7 +70,8 @@ int tlm_format(const FC_tlm *t, char *out, size_t n)
         t->vel[0], t->vel[1], t->vel[2],
         t->gnss_time, t->lat, t->lon, t->gnss_alt, t->sats,
         t->gnss_vel[0], t->gnss_vel[1],
-        t->current, t->volt, t->batt_pct, t->state, (unsigned long)t->e_flag);
+        t->current, t->volt, t->batt_pct, t->state, (unsigned long)t->e_flag,
+        t->prop_deploy, t->rw_status);
     return (len > 0 && (size_t)len < n) ? len : -1;
 }
 

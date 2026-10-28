@@ -8,7 +8,7 @@ stream, re-transmits it on each radio at that radio's rate, relays camera image 
 forwards telecommands from the ground station back to the FC.
 
 ```
-            USART3 921600                 UART5 115200   E22-900T22D LoRa   1 Hz
+            USART3 921600                 UART5 115200   E22-900T22D LoRa   every 3 s (2.4 kbps air, half duplex)
  FC  <------------------------>  RF board <------------> 
    telemetry 10 Hz, $IMG lines            USART2 115200  XBee Pro           5 Hz + image lines
    <- telecommands                        UART4  921600  EC200U GSM         MQTT 15 Hz + image lines + SMS / 60 s
@@ -54,9 +54,9 @@ module baud rates.
 | Task       | Priority     | Stack | Job |
 |------------|--------------|-------|-----|
 | `fc_comms` | AboveNormal  | 4 KB  | parse FC lines into `FC_tlm`, queue `$IMG` lines, send telecommands and `IMGACK` to the FC |
-| `lora`     | Normal       | 4 KB  | telemetry at 1 Hz (240-byte chunk, 500 ms gap, rest) |
-| `xbee`     | Normal       | 4 KB  | telemetry at 5 Hz, image lines in the spare time of each 200 ms slot |
-| `gsm`      | BelowNormal  | 6 KB  | MQTT publish at 15 Hz, one image line per period, SMS with GNSS + mission time every 60 s, `+QMTRECV` telecommands |
+| `lora`     | Normal       | 4 KB  | telemetry every 3 s (240-byte chunk, 1 s gap, rest; ~1.2 s on air at 2.4 kbps, then listens for telecommands) |
+| `xbee`     | Normal       | 4 KB  | telemetry at 5 Hz, one image line in the spare time of each 200 ms slot (~5 KB/s) |
+| `gsm`      | BelowNormal  | 6 KB  | MQTT publish at 15 Hz, one image line per period, SMS with GNSS + mission time every 60 s, `+QMTRECV` and SMS (`+CMT`) telecommands, EC200U GNSS poll every 1 s |
 
 Tunables (periods, APN, broker, client id, topics, SMS number, ring sizes) are the `#define`s
 at the top of `freertos.c`. The APN/broker/topic/phone values are placeholders and must be set
@@ -68,11 +68,16 @@ before flight.
 
 ```
 $,TEAM_ID,TIME,PKT,ACC(x|y|z),GYR(x|y|z),MAG(x|y|z),EUL(r|p|y),ALT,PRES,TEMP,VEL(x|y|z),
-GNSS_TIME,LAT,LON,GNSS_ALT,SATS,GNSS_VEL(x|y),CURRENT,VOLT,BATT%,STATE,EFLAG,#\r\n
+GNSS_TIME,LAT,LON,GNSS_ALT,SATS,GNSS_VEL(x|y),CURRENT,VOLT,BATT%,STATE,EFLAG,PROP_DEPLOY,RW_STATUS,#\r\n
 ```
 
 Each radio sends the same line layout with its own packet counter (`LoRa_tlm`, `Xbee_tlm`,
 `gsm_tlm` are `FC_tlm` with `packet_count` replaced).
+
+**GNSS source:** the EC200U's own GNSS is switched on (`AT+QGPS=1`) and polled once a second
+(`AT+QGPSLOC=2`). Whenever it reports more satellites than the FC's L89, its time, latitude,
+longitude, altitude, satellite count and velocity replace the FC values in every outgoing
+packet (LoRa, XBee, MQTT, SMS). A tie or no modem fix keeps the FC values.
 
 **Image lines** from the FC are relayed verbatim over XBee and on the MQTT image topic:
 
@@ -82,11 +87,31 @@ $IMG,<id>,<seq>,<total>,<len>,<base64>*hh
 $IMGEND,<id>,<total>,<size>*hh
 ```
 
-`IMGACK,<id>,OK` is sent to the FC once both XBee and GSM have drained the image;
-`IMGACK,<id>,FAIL` if the 512-line relay ring overflowed (the FC then resends).
+Each `$IMG` line carries 1024 raw bytes (the FC's `IMG LINK XBEE` default, ~1400 characters per
+line). The 192-line relay ring holds ~190 KB of image. `IMG LINK MQTT` (10240 raw bytes, ~13.8 KB
+lines) is not supported and the RF board refuses to forward that command.
 
-**Telecommands** received on LoRa, XBee or the MQTT command topic are forwarded to the FC as
-one line each, terminated with CRLF.
+`IMGACK,<id>,OK` is sent to the FC once both XBee and GSM have drained the image;
+`IMGACK,<id>,FAIL` if a line was too long or the relay ring overflowed (the FC then resends).
+
+**Telecommands** received on LoRa, XBee, the MQTT command topic or by SMS are cleaned up and
+forwarded to the FC one line at a time, following the FC's `TELECOMMAND_HANDOFF.md`:
+
+- Accepted input: raw FC console words (`BUZZ ON`) or `CMD,<team>,<verb>,<arg,...>`, which is
+  translated to `<VERB> <ARG ...>`.
+- The line is upper-cased, reduced to printable ASCII, spaces are collapsed, CRLF is appended.
+  Lines starting with `$` or empty after cleanup are dropped.
+- At most one command every 20 ms on USART3, lines up to 118 characters (FC limit 127).
+- `ARM` is handled on the RF board and opens a 60 s window. Until then `RESET`, `BURN`, `PAYLOAD`,
+  `DEPLOY`, `PARA`, `STATE`, `PERSIST`, `SD`, `BENCH`, `DIAG` and `SIM` lines are blocked.
+- SMS: the modem delivers incoming texts directly (`AT+CNMI=2,2`); the first line of a text from
+  `SMS_CMD_FROM` (defaults to `SMS_NUMBER`) is treated as a command, texts from other numbers are
+  dropped. Acks for SMS commands still go to the MQTT ack topic.
+- After `GYRO CAL` the RF board holds further commands for 13 s and after `SD CLEAR` for 3 s,
+  because the FC's command task is blocked meanwhile. Queued commands go out afterwards in order.
+- The FC does not reply on USART3. The RF board publishes one ack per line on the MQTT ack topic:
+  `OK <line>` when forwarded, `ARMED`, `ARM? <line>` when blocked, `BAD <line>` when unusable.
+  Confirm the effect through the `STATE`/`EFLAG` telemetry fields.
 
 ## Build and test
 
@@ -99,4 +124,5 @@ Host self-checks (not part of the firmware build):
 cd Tests
 gcc -I../Core/Inc test_telemetry.c ../Core/Src/telemetry.c -o t && ./t
 gcc -Istubs -I../Core/Inc test_img_ring.c ../Core/Src/telemetry.c -o t && ./t
+gcc -Istubs -I../Core/Inc test_telecommand.c ../Core/Src/telemetry.c -o t && ./t
 ```

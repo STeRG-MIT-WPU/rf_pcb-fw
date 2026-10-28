@@ -26,6 +26,8 @@
 /* USER CODE BEGIN Includes */
 #include "cmsis_os.h"
 #include "telemetry.h"
+#include <ctype.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +42,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* ---------------- tunables ---------------- */
-#define LORA_PERIOD_MS      1000
+#define LORA_PERIOD_MS      3000    /* E22 air rate 2.4 kbps: one ~280 B frame is ~1.15 s on air (half duplex); the rest is the telecommand window */
 #define XBEE_PERIOD_MS      200
 #define GSM_PERIOD_MS       66      /* ~15 Hz; see note in gsm_task */
 #define SMS_PERIOD_MS       60000
@@ -51,12 +53,14 @@
 #define MQTT_RETRIES_PER_NET 5      /* after this many broker misses, redo the network bring-up as well */
 #define SMS_TIMEOUT_MS      8000    /* +CMGS can take seconds; publishing pauses meanwhile */
 #define LORA_CHUNK          240     /* E22 UART sub-packet: send 240, pause, send the rest (rf_txtest build) */
-#define LORA_CHUNK_GAP_MS   500
+#define LORA_CHUNK_GAP_MS   1000    /* first chunk must be fully on air before the tail (was 500 at 62.5 kbps) */
 #define XBEE_CTS_WAIT_MS    50
+#define XBEE_PIECE          256     /* bytes per XBee write between nCTS checks (one RF packet) */
 #define XBEE_IMG_MARGIN_MS  25      /* stop relaying image lines this close to the next telemetry slot */
 #define GSM_IMG_PER_PERIOD  1       /* image lines published per GSM period (~15 lines/s) */
-#define IMG_RING            512     /* buffered $IMG lines; ponytail: 132 KB static, one ~69 KB image fits */
-#define IMG_LINE_MAX        256     /* $IMG,<id>,<seq>,<total>,<len>,<180 base64>*hh\r\n is ~215 */
+#define IMG_RING            192     /* buffered $IMG lines: 270 KB static in RAM3 (384 KB), ~190 KB of image */
+#define IMG_LINE_MAX        1408    /* $IMG line of 1024 raw bytes (IMG LINK XBEE, FC default) is ~1400 chars.
+                                       IMG LINK MQTT lines (~13.8 KB) do not fit: that command is blocked */
 
 #define GSM_APN         "airtelgprs.com"
 #define MQTT_BROKER     "broker.hivemq.com"
@@ -65,11 +69,16 @@
 #define MQTT_TOPIC_TLM  "cansat/011/tlm"
 #define MQTT_TOPIC_CMD  "cansat/011/cmd"
 #define MQTT_TOPIC_IMG  "cansat/011/img"
+#define MQTT_TOPIC_ACK  "cansat/011/ack"   /* "OK <cmd>" when forwarded, "ARMED", "ARM? <cmd>", "BAD <cmd>" */
 #define SMS_NUMBER      "+916375605728"
+#define SMS_CMD_FROM    "+919373986194"  /* only SMS from this number are telecommands; "" accepts any sender */
 
-#define TC_MAX          120     /* longest telecommand line incl. CRLF */
-#define FC_DMA_BUF      512
+#define TC_MAX          120     /* longest telecommand line incl. CRLF (FC limit 127) */
+#define TC_GAP_MS       20      /* FC asks for >= 20 ms between command lines */
+#define TC_ARM_MS       60000   /* ARM opens this window for RESET/BURN/DEPLOY/PARA/STATE/PERSIST/SD/BENCH/DIAG/SIM */
+#define FC_DMA_BUF      2048    /* 1.4 KB $IMG lines arrive back to back at 921600 (10 ms apart) */
 #define GSM_ACC_MAX     1024
+#define GNSS_PERIOD_MS  1000    /* AT+QGPSLOC poll of the EC200U GNSS; blocks the gsm loop ~100 ms each time */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -81,7 +90,7 @@
 /* USER CODE BEGIN Variables */
 /* RF board application tasks live here (see RF_Tasks_Init at the bottom):
  *   fc_comms  USART3 (DMA)  parse FC telemetry, queue $IMG lines, relay ground-station commands to the FC
- *   lora      UART5         E22-900T22D, telemetry at 1 Hz
+ *   lora      UART5         E22-900T22D, telemetry every 3 s
  *   xbee      USART2        XBee Pro, telemetry at 5 Hz + image lines in between
  *   gsm       UART4         EC200U, MQTT at 15 Hz + image lines + SMS every 60 s
  */
@@ -91,10 +100,13 @@ extern DMA_HandleTypeDef  hdma_usart3_rx;
 /* ---------------- shared state ---------------- */
 static FC_tlm        fc_tlm;              /* latest packet from the FC */
 static bool          fc_valid;
+static FC_tlm        gsm_gnss;            /* EC200U fix, GNSS fields only; sats 0 = no fix. Guarded by fc_mutex */
 static osMutexId_t   fc_mutex;
 
 typedef struct { uint8_t len; char data[TC_MAX]; } tc_msg_t;
 static osMessageQueueId_t tc_q;           /* radios/ISRs -> fc_comms -> FC */
+static osMessageQueueId_t ack_q;          /* fc_comms -> gsm -> MQTT_TOPIC_ACK */
+static uint32_t           tc_armed_until; /* tick until which irreversible commands pass */
 
 static osThreadId_t fc_task_h, gsm_task_h;
 enum { FLAG_RX = 1, FLAG_RESET = 2 };
@@ -139,6 +151,15 @@ static bool tlm_snapshot(FC_tlm *dst, uint32_t packet_count)
     if (!fc_valid) return false;
     osMutexAcquire(fc_mutex, osWaitForever);
     tlm_copy(dst, &fc_tlm, packet_count);
+    if (gsm_gnss.sats > dst->sats) {       /* ponytail: more satellites wins; compare HDOP too if both fixes are weak */
+        dst->gnss_time = gsm_gnss.gnss_time;
+        dst->lat = gsm_gnss.lat;
+        dst->lon = gsm_gnss.lon;
+        dst->gnss_alt = gsm_gnss.gnss_alt;
+        dst->sats = gsm_gnss.sats;
+        dst->gnss_vel[0] = gsm_gnss.gnss_vel[0];
+        dst->gnss_vel[1] = gsm_gnss.gnss_vel[1];
+    }
     osMutexRelease(fc_mutex);
     return true;
 }
@@ -155,6 +176,68 @@ static void tc_push(const char *s, size_t len)
     m.data[len++] = '\n';
     m.len = len;
     osMessageQueuePut(tc_q, &m, 0, 0);
+}
+
+/* ---------------- telecommands (FC TELECOMMAND_HANDOFF.md, sections 2, 4, 7) ----------------
+ * Normalise a ground-station line for the FC console and decide whether to forward it. Accepts the
+ * raw console words ("BUZZ ON") or CMD,<team>,<verb>,<arg,...>. Upper-cases, keeps printable ASCII
+ * only, collapses spaces, refuses '$' lines. Irreversible words, DIAG and SIM need an ARM line first
+ * (ARM is consumed here, never sent to the FC). Leaves the clean line in m (no CRLF) and returns the
+ * ack word for the ground: "OK" = forwarded, "ARMED", "ARM?" = blocked, "BAD" = unusable. */
+static const char *tc_filter(tc_msg_t *m)
+{
+    /* ponytail: whole-word check, so read-only STATE / PERSIST / SD also need ARM; they only print on USB anyway */
+    static const char *const armed_only[] = { "RESET", "BURN", "PAYLOAD", "DEPLOY", "STATE", "PERSIST",
+                                              "SD", "BENCH", "DIAG", "SIM", "PARA", NULL };
+    char *d = m->data;
+    uint8_t n = 0, i = 0;
+    bool cmd_fmt = m->len > 4 && strncmp(d, "CMD,", 4) == 0;
+
+    if (cmd_fmt) {                                  /* CMD,<team>,VERB,ARG -> VERB ARG */
+        int commas = 0;
+        while (i < m->len && commas < 2) if (d[i++] == ',') commas++;
+    }
+    for (; i < m->len; i++) {
+        char c = d[i];
+        if (cmd_fmt && c == ',') c = ' ';
+        if (c < 0x20 || c > 0x7e) continue;
+        if (c == ' ' && (n == 0 || d[n - 1] == ' ')) continue;
+        d[n++] = (char)toupper((unsigned char)c);
+    }
+    while (n && d[n - 1] == ' ') n--;
+    m->len = n;
+    if (n == 0 || d[0] == '$' || n > TC_MAX - 2) return "BAD";
+    d[n] = 0;                                       /* queue payloads carry no terminator */
+    if (strcmp(d, "IMG LINK MQTT") == 0) return "BAD";  /* its ~13.8 KB $IMG lines exceed IMG_LINE_MAX */
+
+    size_t w = strcspn(d, " ,");                    /* SIM,t,alt,... has no space after the word */
+    if (w == 3 && strncmp(d, "ARM", 3) == 0) {
+        tc_armed_until = osKernelGetTickCount() + TC_ARM_MS;
+        return "ARMED";
+    }
+    for (int k = 0; armed_only[k]; k++)
+        if (strlen(armed_only[k]) == w && strncmp(d, armed_only[k], w) == 0 &&
+            (int32_t)(tc_armed_until - osKernelGetTickCount()) <= 0)
+            return "ARM?";
+    return "OK";
+}
+
+/* Queue "<status> <line>" for the gsm task to publish on MQTT_TOPIC_ACK (handoff section 8, option A). */
+/* The FC's command task blocks on these (handoff 4.4, 10); hold our queue meanwhile so nothing
+ * piles into its 512-byte RX ring. Returns the extra ms to wait after sending the line. */
+static uint32_t tc_hold(const char *line)
+{
+    if (strncmp(line, "GYRO CAL", 8) == 0) return 13000;   /* waits for gyro status 3, then averages 3 s */
+    if (strncmp(line, "SD CLEAR", 8) == 0) return 3000;    /* a few seconds with a full card */
+    return 0;
+}
+
+static void tc_ack(const char *status, const tc_msg_t *m)
+{
+    tc_msg_t a;
+    int n = snprintf(a.data, sizeof a.data, "%s %.*s", status, (int)m->len, m->data);
+    a.len = (uint8_t)(n < (int)sizeof a.data ? n : (int)sizeof a.data - 1);
+    osMessageQueuePut(ack_q, &a, 0, 0);
 }
 
 /* ---------------- UART callbacks ---------------- */
@@ -250,8 +333,9 @@ static void fc_handle_line(const char *line)
 
 static void fc_comms_task(void *arg)
 {
-    static char line[TLM_LINE_MAX];
+    static char line[IMG_LINE_MAX];
     uint16_t tail = 0, ll = 0;
+    uint32_t tc_last = 0;
     tc_msg_t m;
 
     fc_task_h = osThreadGetId();
@@ -275,8 +359,18 @@ static void fc_comms_task(void *arg)
             }
         }
 
-        while (osMessageQueueGet(tc_q, &m, NULL, 0) == osOK)
-            HAL_UART_Transmit(&huart3, (uint8_t *)m.data, m.len, 50);
+        /* one command per pass, at least TC_GAP_MS apart (the FC polls its 512-byte ring every 20 ms) */
+        if ((int32_t)(osKernelGetTickCount() - tc_last) >= TC_GAP_MS &&
+            osMessageQueueGet(tc_q, &m, NULL, 0) == osOK) {
+            const char *st = tc_filter(&m);
+            tc_ack(st, &m);
+            if (st[0] == 'O') {
+                m.data[m.len++] = '\r';
+                m.data[m.len++] = '\n';
+                HAL_UART_Transmit(&huart3, (uint8_t *)m.data, m.len, 50);
+                tc_last = osKernelGetTickCount() + tc_hold(m.data);
+            }
+        }
 
         if (img_ack_id >= 0 && img_min_read() >= img_ack_seq) {
             img_ack(img_ack_id, true);
@@ -313,10 +407,14 @@ static void lora_task(void *arg)
 /* ---------------- 3. XBee ---------------- */
 static bool xbee_write(const char *s, int len)
 {
-    /* XBee nCTS high = its UART buffer is full; wait a little, then send anyway */
-    for (int i = 0; i < XBEE_CTS_WAIT_MS / 5 && HAL_GPIO_ReadPin(XBEE_nCTS_GPIO_Port, XBEE_nCTS_Pin) == GPIO_PIN_SET; i++)
-        osDelay(5);
-    return len > 0 && HAL_UART_Transmit(&huart2, (uint8_t *)s, len, 100) == HAL_OK;
+    /* XBee nCTS high = its UART buffer is nearly full: check before each XBEE_PIECE, wait a little, then send anyway */
+    for (int off = 0; off < len; off += XBEE_PIECE) {
+        int n = len - off < XBEE_PIECE ? len - off : XBEE_PIECE;
+        for (int i = 0; i < XBEE_CTS_WAIT_MS / 5 && HAL_GPIO_ReadPin(XBEE_nCTS_GPIO_Port, XBEE_nCTS_Pin) == GPIO_PIN_SET; i++)
+            osDelay(5);
+        if (HAL_UART_Transmit(&huart2, (uint8_t *)s + off, n, 100) != HAL_OK) return false;
+    }
+    return len > 0;
 }
 
 static void xbee_task(void *arg)
@@ -331,9 +429,9 @@ static void xbee_task(void *arg)
     for (;;) {
         if (tlm_snapshot(&t, count + 1) && xbee_write(buf, tlm_format(&t, buf, sizeof buf))) count++;
 
-        /* image lines fill the rest of the 200 ms slot (~19 ms each at 115200) */
+        /* image lines fill the rest of the 200 ms slot: ~125 ms per 1.4 KB line at 115200 (len/10 ms), so one per slot */
         while ((l = img_peek(&img_r_xbee)) &&
-               (int32_t)(next + XBEE_PERIOD_MS - osKernelGetTickCount()) > XBEE_IMG_MARGIN_MS) {
+               (int32_t)(next + XBEE_PERIOD_MS - osKernelGetTickCount()) > XBEE_IMG_MARGIN_MS + l->len / 10) {
             xbee_write(l->data, l->len);
             img_r_xbee++;
         }
@@ -365,10 +463,30 @@ static bool gsm_has(const char *s)
 }
 
 /* Pull "+QMTRECV: 0,<id>,"<topic>","<payload>"" out of the accumulator and queue the payload
- * for the FC. Also reports a dropped MQTT link (+QMTSTAT). */
+ * for the FC. Same for an SMS delivered as "+CMT: "<sender>",,"<time>"\r\n<text>\r\n" (AT+CNMI=2,2),
+ * if the sender is SMS_CMD_FROM. Also reports a dropped MQTT link (+QMTSTAT). */
 static bool gsm_handle_urc(void)
 {
     char cmd[TC_MAX];
+    for (;;) {
+        size_t n = 0;
+        char *p, *hdr, *body;
+        bool from_ok = false;
+        taskENTER_CRITICAL();
+        p = strstr(gsm_acc, "+CMT:");
+        if (p && (hdr = strstr(p, "\r\n")) && (body = strstr(hdr + 2, "\r\n"))) {   /* header and text complete */
+            *hdr = 0;
+            from_ok = !SMS_CMD_FROM[0] || strstr(p, SMS_CMD_FROM) != NULL;
+            n = (size_t)(body - hdr - 2);
+            if (n > sizeof cmd) n = sizeof cmd;
+            memcpy(cmd, hdr + 2, n);
+            memmove(p, body + 2, strlen(body + 2) + 1);
+            gsm_acc_len = strlen(gsm_acc);
+        }
+        taskEXIT_CRITICAL();
+        if (!p || !n) break;                                /* none, one still arriving, or empty text */
+        if (from_ok) tc_push(cmd, n);                       /* ponytail: a multi-line SMS forwards its first line only */
+    }
     for (;;) {
         size_t n = 0;
         char *p, *q[4] = {0};
@@ -413,6 +531,51 @@ static bool gsm_cmd(const char *cmd, const char *expect, uint32_t timeout_ms)
     return gsm_wait(expect, timeout_ms);
 }
 
+/* "+QGPSLOC: hhmmss.sss,lat,lon,hdop,alt,fix,cog,spkm,spkn,ddmmyy,nsat" (AT+QGPSLOC=2) -> GNSS fields of *g.
+ * Velocity east|north from speed over ground and course. false if the line is missing or malformed. */
+static bool gnss_parse(const char *s, FC_tlm *g)
+{
+    double v[11];
+    char *end;
+    if (!(s = strstr(s, "+QGPSLOC:"))) return false;
+    s += 9;
+    for (int i = 0; i < 11; i++) {
+        v[i] = strtod(s, &end);
+        if (i < 10 && *end != ',') return false;
+        s = end + 1;
+    }
+    int hh = (int)(v[0] / 10000), mm = (int)(v[0] / 100) % 100;
+    g->gnss_time = (float)(hh * 3600 + mm * 60) + (float)(v[0] - hh * 10000 - mm * 100);
+    g->lat = v[1];
+    g->lon = v[2];
+    g->gnss_alt = (float)v[4];
+    g->sats = (int)v[10];
+    float spd = (float)v[7] / 3.6f, cog = (float)v[6] * 3.14159265f / 180.0f;
+    g->gnss_vel[0] = spd * sinf(cog);
+    g->gnss_vel[1] = spd * cosf(cog);
+    return true;
+}
+
+/* Every GNSS_PERIOD_MS ask the modem for its fix; no fix (+CME ERROR: 516) clears gsm_gnss. */
+static void gsm_gnss_update(uint32_t *last)
+{
+    char line[128];
+    FC_tlm g;
+    if (osKernelGetTickCount() - *last < GNSS_PERIOD_MS) return;
+    *last = osKernelGetTickCount();
+    bool ok = gsm_cmd("AT+QGPSLOC=2\r\n", "OK", 1000);
+    if (ok) {
+        taskENTER_CRITICAL();
+        strncpy(line, gsm_acc, sizeof line - 1);
+        line[sizeof line - 1] = 0;
+        taskEXIT_CRITICAL();
+        ok = gnss_parse(line, &g);
+    }
+    osMutexAcquire(fc_mutex, osWaitForever);
+    if (ok) gsm_gnss = g; else gsm_gnss.sats = 0;
+    osMutexRelease(fc_mutex);
+}
+
 static bool gsm_connect(void)
 {
     char cmd[128];
@@ -421,6 +584,7 @@ static bool gsm_connect(void)
     for (i = 0; i < 10 && !gsm_cmd("AT\r\n", "OK", 500); i++) osDelay(500);
     if (i == 10) return false;
     gsm_cmd("ATE0\r\n", "OK", 500);
+    gsm_cmd("AT+QGPS=1\r\n", "OK", 2000);                       /* GNSS on; ERROR if already running: fine */
     if (!gsm_cmd("AT+CPIN?\r\n", "READY", 2000)) return false;
     for (i = 0; i < 60; i++) {
         gsm_cmd("AT+CREG?\r\n", "OK", 1000);
@@ -429,6 +593,7 @@ static bool gsm_connect(void)
     }
     if (i == 60) return false;
     gsm_cmd("AT+CMGF=1\r\n", "OK", 1000);                       /* SMS text mode */
+    gsm_cmd("AT+CNMI=2,2,0,0,0\r\n", "OK", 1000);               /* incoming SMS straight to the UART as +CMT, not stored */
     snprintf(cmd, sizeof cmd, "AT+QICSGP=1,1,\"%s\",\"\",\"\",1\r\n", GSM_APN);
     if (!gsm_cmd(cmd, "OK", 2000)) return false;
     gsm_cmd("AT+QIACT=1\r\n", "OK", 30000);                     /* ERROR if already active: fine */
@@ -480,8 +645,9 @@ static void gsm_task(void *arg)
 {
     static char buf[TLM_LINE_MAX];
     gsm_tlm t;
+    tc_msg_t a;
     const img_line_t *l;
-    uint32_t count = 0, next = 0, last_sms = 0;
+    uint32_t count = 0, next = 0, last_sms = 0, last_gnss = 0;
     int fails = 0;
     bool online = false, net_up = false;
 
@@ -492,10 +658,12 @@ static void gsm_task(void *arg)
     for (;;) {
         if (!online) {
             img_r_gsm = img_w;                 /* offline: do not hold the image ring (and XBee) back */
+            osMessageQueueReset(ack_q);        /* stale acks are useless */
             if (!net_up) net_up = gsm_connect();
             online = net_up && mqtt_connect();
             if (!online) {                     /* keep trying the broker; every Nth miss redo the modem bring-up too */
                 if (++fails % MQTT_RETRIES_PER_NET == 0) net_up = false;
+                if (net_up) gsm_gnss_update(&last_gnss);   /* fix is useful to LoRa/XBee even with no broker */
                 osDelay(MQTT_RETRY_MS);
                 continue;
             }
@@ -518,11 +686,15 @@ static void gsm_task(void *arg)
             img_r_gsm++;                       /* a failed line is dropped; the image is incomplete over MQTT */
         }
 
+        while (online && osMessageQueueGet(ack_q, &a, NULL, 0) == osOK)
+            if (!mqtt_publish(MQTT_TOPIC_ACK, a.data, a.len) && ++fails >= GSM_MAX_FAILS) online = false;
+
         if (fc_valid && osKernelGetTickCount() - last_sms >= SMS_PERIOD_MS) {
             last_sms = osKernelGetTickCount();
             send_sms(&t);
         }
 
+        gsm_gnss_update(&last_gnss);
         if (gsm_handle_urc()) online = false;
         sleep_until(&next, GSM_PERIOD_MS);
     }
@@ -538,6 +710,7 @@ void RF_Tasks_Init(void)
 
     fc_mutex = osMutexNew(NULL);
     tc_q     = osMessageQueueNew(8, sizeof(tc_msg_t), NULL);
+    ack_q    = osMessageQueueNew(4, sizeof(tc_msg_t), NULL);
 
     osThreadNew(fc_comms_task, NULL, &fc_attr);
     osThreadNew(lora_task,     NULL, &lora_attr);

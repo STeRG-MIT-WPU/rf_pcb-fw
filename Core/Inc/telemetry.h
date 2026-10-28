@@ -3,7 +3,7 @@
  *
  * FC line on USART3 (921600, 10 Hz), see FC README "Telemetry packet":
  * $,TEAM_ID,TIME,PKT,ACC(x|y|z),GYR(x|y|z),MAG(x|y|z),EUL(r|p|y),ALT,PRES,TEMP,
- *   VEL(x|y|z),GNSS_TIME,LAT,LON,GNSS_ALT,SATS,GNSS_VEL(x|y),CURRENT,VOLT,BATT%,STATE,EFLAG,#\r\n
+ *   VEL(x|y|z),GNSS_TIME,LAT,LON,GNSS_ALT,SATS,GNSS_VEL(x|y),CURRENT,VOLT,BATT%,STATE,EFLAG,PROP_DEPLOY,RW_STATUS,#\r\n
  */
 #ifndef TELEMETRY_H
 #define TELEMETRY_H
@@ -35,6 +35,8 @@ typedef struct {
     float    batt_pct;
     int      state;
     uint32_t e_flag;         /* hex bitfield */
+    int      prop_deploy;    /* 0 stowed, 1 deployed motors off, 2 deployed motors on */
+    int      rw_status;      /* 1 while reaction wheel loop on */
 } FC_tlm;
 
 /* Per-radio packets: every FC_tlm field, but packet_count is that radio's own

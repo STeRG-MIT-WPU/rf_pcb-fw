@@ -31,10 +31,14 @@ enum { osOK = 0, osFlagsWaitAny = 0, osWaitForever = ~0u, osFlagsError = 0x80000
 #define osMutexRelease(m) 0
 #define osMutexNew(a) NULL
 #define osMessageQueueNew(n, s, a) NULL
-#define osMessageQueuePut(q, m, p, t) 0
+static char stub_q[256];                       /* last message put on any queue */
+static int stub_qput(const void *m, size_t n) { memcpy(stub_q, m, n < sizeof stub_q ? n : sizeof stub_q); return 0; }
+#define osMessageQueuePut(q, m, p, t) stub_qput(m, sizeof *(m))
 #define osMessageQueueGet(q, m, p, t) 1
+#define osMessageQueueReset(q) 0
 #define osThreadNew(f, a, at) NULL
 #define osDelay(ms)
-#define osKernelGetTickCount() 0
+static uint32_t stub_tick;
+#define osKernelGetTickCount() stub_tick
 HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *h, const uint8_t *p, uint16_t n, uint32_t t);
 #endif
