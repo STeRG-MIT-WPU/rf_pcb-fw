@@ -15,6 +15,8 @@ enum { osOK = 0, osFlagsWaitAny = 0, osWaitForever = ~0u, osFlagsError = 0x80000
 #define XBEE_nRTS_Pin 0
 #define XBEE_nCTS_GPIO_Port 0
 #define XBEE_nCTS_Pin 0
+static uint32_t stub_tick;
+#define osKernelGetTickCount() stub_tick
 #define __DMB()
 #define taskENTER_CRITICAL()
 #define taskEXIT_CRITICAL()
@@ -37,8 +39,6 @@ static int stub_qput(const void *m, size_t n) { memcpy(stub_q, m, n < sizeof stu
 #define osMessageQueueGet(q, m, p, t) 1
 #define osMessageQueueReset(q) 0
 #define osThreadNew(f, a, at) NULL
-#define osDelay(ms)
-static uint32_t stub_tick;
-#define osKernelGetTickCount() stub_tick
+#define osDelay(ms) (stub_tick += (ms))
 HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *h, const uint8_t *p, uint16_t n, uint32_t t);
 #endif

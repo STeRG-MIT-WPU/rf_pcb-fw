@@ -57,6 +57,10 @@
 #define XBEE_CTS_WAIT_MS    50
 #define XBEE_PIECE          256     /* bytes per XBee write between nCTS checks (one RF packet) */
 #define XBEE_IMG_MARGIN_MS  25      /* stop relaying image lines this close to the next telemetry slot */
+#define XBEE_AT_MAX         64      /* longest XBee AT telecommand, e.g. "ATCH 11" (rf 4 reference values) */
+#define XBEE_AT_GUARD_MS    1100    /* silence required before "+++" */
+#define XBEE_AT_RESP_MS     2000    /* wait for each XBee reply */
+#define XBEE_AT_SETTLE_MS   100     /* pause after ATCN before relaying again */
 #define GSM_IMG_PER_PERIOD  1       /* image lines published per GSM period (~15 lines/s) */
 #define IMG_RING            192     /* buffered $IMG lines: 270 KB static in RAM3 (384 KB), ~190 KB of image */
 #define IMG_LINE_MAX        1408    /* $IMG line of 1024 raw bytes (IMG LINK XBEE, FC default) is ~1400 chars.
@@ -123,6 +127,15 @@ static uint32_t          img_ack_seq;          /* readers must reach this seq be
 
 static uint8_t fc_dma_buf[FC_DMA_BUF];
 static uint8_t lora_rx[TC_MAX], xbee_rx[TC_MAX], gsm_rx[128];
+
+/* XBee AT telecommand (ported from the rf 4 reference main.c): a USART2 line starting with "AT" configures
+ * the XBee itself instead of going to the FC. The ISR queues it (XAT_PENDING); xbee_task runs the sequence
+ * (XAT_RUNNING: USART2 RX is the module's reply and goes to xbee_at_acc, not to the FC). One at a time. */
+enum { XAT_IDLE, XAT_PENDING, XAT_RUNNING };
+static volatile uint8_t  xbee_at_state;
+static char              xbee_at_cmd[XBEE_AT_MAX];
+static char              xbee_at_acc[64];
+static volatile uint8_t  xbee_at_acc_len;
 
 /* EC200U response accumulator: ISR appends, gsm task reads/clears under a critical section */
 static char              gsm_acc[GSM_ACC_MAX];
@@ -240,6 +253,31 @@ static void tc_ack(const char *status, const tc_msg_t *m)
     osMessageQueuePut(ack_q, &a, 0, 0);
 }
 
+/* ---------------- XBee AT telecommands, ISR side ---------------- */
+/* "AT..." line -> xbee_at_cmd (no CR/LF), true. Anything else -> false, it is for the FC.
+ * While a command is queued or running, further AT lines are dropped (reference: "busy, dropped"). */
+static bool xbee_at_queue(const char *s, size_t n)
+{
+    size_t len = 0;
+    while (n && (*s == '\r' || *s == '\n' || *s == ' ')) s++, n--;
+    if (n < 2 || s[0] != 'A' || s[1] != 'T') return false;
+    if (xbee_at_state != XAT_IDLE) return true;
+    while (len < n && len < XBEE_AT_MAX - 1 && s[len] != '\r' && s[len] != '\n') len++;
+    memcpy(xbee_at_cmd, s, len);
+    xbee_at_cmd[len] = 0;
+    xbee_at_state = XAT_PENDING;
+    return true;
+}
+
+static void xbee_at_collect(const uint8_t *s, size_t n)
+{
+    if (xbee_at_acc_len + n < sizeof xbee_at_acc) {
+        memcpy(xbee_at_acc + xbee_at_acc_len, s, n);
+        xbee_at_acc_len += n;
+        xbee_at_acc[xbee_at_acc_len] = 0;
+    }
+}
+
 /* ---------------- UART callbacks ---------------- */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *h, uint16_t size)
 {
@@ -256,8 +294,9 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *h, uint16_t size)
     } else if (h == &huart5) {              /* LoRa: transparent mode, payload is the command */
         tc_push((char *)lora_rx, size);     /* ponytail: a command split across two IDLE events becomes two lines */
         HAL_UARTEx_ReceiveToIdle_IT(&huart5, lora_rx, sizeof lora_rx);
-    } else if (h == &huart2) {              /* XBee: transparent mode */
-        tc_push((char *)xbee_rx, size);
+    } else if (h == &huart2) {              /* XBee: transparent mode; "AT..." lines configure the XBee itself */
+        if (xbee_at_state == XAT_RUNNING) xbee_at_collect(xbee_rx, size);
+        else if (!xbee_at_queue((char *)xbee_rx, size)) tc_push((char *)xbee_rx, size);
         HAL_UARTEx_ReceiveToIdle_IT(&huart2, xbee_rx, sizeof xbee_rx);
     }
 }
@@ -417,6 +456,96 @@ static bool xbee_write(const char *s, int len)
     return len > 0;
 }
 
+/* ---------------- XBee AT telecommands, task side ---------------- */
+static void xbee_at_clear(void)
+{
+    taskENTER_CRITICAL();
+    xbee_at_acc_len = 0;
+    xbee_at_acc[0] = 0;
+    taskEXIT_CRITICAL();
+}
+
+/* Wait for one reply line from the XBee (ends in '\r'); out gets it without CR/LF. false on timeout. */
+static bool xbee_at_wait(char *out, size_t n, uint32_t timeout_ms)
+{
+    uint32_t deadline = osKernelGetTickCount() + timeout_ms;
+    for (;;) {
+        bool done = false;
+        taskENTER_CRITICAL();
+        const char *p = xbee_at_acc;
+        while (*p == '\r' || *p == '\n') p++;
+        if (*p && strchr(p, '\r')) {
+            size_t l = strcspn(p, "\r\n");
+            if (l >= n) l = n - 1;
+            memcpy(out, p, l);
+            out[l] = 0;
+            xbee_at_acc_len = 0;
+            xbee_at_acc[0] = 0;
+            done = true;
+        }
+        taskEXIT_CRITICAL();
+        if (done) return true;
+        if ((int32_t)(deadline - osKernelGetTickCount()) <= 0) return false;
+        osDelay(10);
+    }
+}
+
+/* "RESP|<cmd>|<status>|<detail>\r\n" to the ground; the XBee must be in transparent mode. */
+static void xbee_at_resp(const char *status, const char *detail)
+{
+    char buf[96];
+    int n = snprintf(buf, sizeof buf, "RESP|%.4s|%s|%s\r\n", xbee_at_cmd, status, detail);
+    xbee_write(buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1);
+}
+
+/* Run the queued AT telecommand, same sequence as the rf 4 reference but blocking in this task (telemetry
+ * and image lines pause, so the XBee sees the guard silence):
+ *   guard -> "+++" (OK) -> "<cmd>\r" -> "ATWR\r" only when a value was set (never for ATWR/ATCN/ATFR/ATRE
+ *   or plain queries) -> "ATCN\r" -> settle -> RESP|<cmd>|OK/ERROR|<detail>
+ * RF-link changes (ATCH/ATID/ATDH/ATDL/ATZS/ATEE/ATEO/ATKY) are answered "OK|ACCEPTED" before they run,
+ * because afterwards the link may no longer work; ATFR gets no reply (module reboots). */
+static void xbee_at_run(void)
+{
+    static const char *const rf_change[] = { "ATCH", "ATID", "ATDH", "ATDL", "ATZS", "ATEE", "ATEO", "ATKY", NULL };
+    static const char *const no_wr[]     = { "ATWR", "ATCN", "ATFR", "ATRE", NULL };
+    const char *cmd = xbee_at_cmd, *status = "OK", *detail = "-";
+    char line[XBEE_AT_MAX + 2], resp[32], result[32];
+    bool early = false;
+    int k;
+
+    for (k = 0; rf_change[k]; k++) if (strncmp(cmd, rf_change[k], 4) == 0) early = true;
+    if (early) xbee_at_resp("OK", "ACCEPTED");
+
+    xbee_at_state = XAT_RUNNING;                    /* USART2 RX now feeds xbee_at_acc */
+    osDelay(XBEE_AT_GUARD_MS);
+    xbee_at_clear();                                /* discard anything received so far; keep only the reply */
+    if (!xbee_write("+++", 3)) { status = "ERROR"; detail = "UART"; }
+    else if (!xbee_at_wait(resp, sizeof resp, XBEE_AT_RESP_MS) || !strstr(resp, "OK")) {
+        status = "ERROR"; detail = "NO_CMD_MODE";   /* reference aborts here without ATCN */
+    } else {
+        int n = snprintf(line, sizeof line, "%s\r", cmd);
+        if (!xbee_write(line, n)) { status = "ERROR"; detail = "UART"; }
+        else if (!xbee_at_wait(result, sizeof result, XBEE_AT_RESP_MS)) { status = "ERROR"; detail = "TIMEOUT"; }
+        else {
+            detail = result;                        /* first reply line, e.g. "OK" or "3001" */
+            if (strstr(result, "ERR")) status = "ERROR";
+            else {
+                bool wr = strlen(cmd) > 4;          /* a value was set: save it to flash */
+                for (k = 0; no_wr[k]; k++) if (strcmp(cmd, no_wr[k]) == 0) wr = false;
+                if (wr && (!xbee_write("ATWR\r", 5) || !xbee_at_wait(resp, sizeof resp, XBEE_AT_RESP_MS) ||
+                           !strstr(resp, "OK"))) {
+                    status = "ERROR"; detail = "ATWR_FAIL";
+                }
+            }
+        }
+        if (strcmp(cmd, "ATCN") != 0) xbee_write("ATCN\r", 5);
+        osDelay(XBEE_AT_SETTLE_MS);                 /* the OK to ATCN arrives meanwhile and is dropped */
+    }
+    xbee_at_clear();
+    xbee_at_state = XAT_IDLE;
+    if (!early && strcmp(cmd, "ATFR") != 0) xbee_at_resp(status, detail);
+}
+
 static void xbee_task(void *arg)
 {
     static char buf[TLM_LINE_MAX];
@@ -427,6 +556,7 @@ static void xbee_task(void *arg)
     HAL_GPIO_WritePin(XBEE_nRTS_GPIO_Port, XBEE_nRTS_Pin, GPIO_PIN_RESET);   /* we are always ready to receive */
     HAL_UARTEx_ReceiveToIdle_IT(&huart2, xbee_rx, sizeof xbee_rx);
     for (;;) {
+        if (xbee_at_state == XAT_PENDING) xbee_at_run();   /* ~1.5-3 s with no telemetry on XBee */
         if (tlm_snapshot(&t, count + 1) && xbee_write(buf, tlm_format(&t, buf, sizeof buf))) count++;
 
         /* image lines fill the rest of the 200 ms slot: ~125 ms per 1.4 KB line at 115200 (len/10 ms), so one per slot */

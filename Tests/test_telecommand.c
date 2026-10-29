@@ -6,7 +6,16 @@
 
 UART_HandleTypeDef huart2, huart3, huart4, huart5;
 DMA_HandleTypeDef hdma_usart3_rx;
-HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *h, const uint8_t *p, uint16_t n, uint32_t t) { return HAL_OK; }
+static char uart2_log[256];                     /* everything written to the XBee, concatenated */
+static bool xbee_sim = true;                    /* fake XBee: answers in command mode when true */
+HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *h, const uint8_t *p, uint16_t n, uint32_t t)
+{
+    if (h != &huart2) return HAL_OK;
+    strncat(uart2_log, (const char *)p, n);
+    if (xbee_sim && xbee_at_state == XAT_RUNNING)
+        xbee_at_collect((const uint8_t *)(n == 5 && !memcmp(p, "ATVR\r", 5) ? "3001\r" : "OK\r"), n == 5 && !memcmp(p, "ATVR\r", 5) ? 5 : 3);
+    return HAL_OK;
+}
 
 static const char *run(const char *in, const char *want_line)
 {
@@ -63,6 +72,19 @@ int main(void)
     gsm_acc_len = strlen(gsm_acc);
     stub_q[0] = 0;
     assert(!gsm_handle_urc() && stub_q[0] == 0 && strstr(gsm_acc, "+CMT:") != NULL);
+    /* XBee AT telecommands (rf 4 reference): an "AT" line on USART2 configures the XBee, nothing goes to the FC */
+    assert(!xbee_at_queue("BUZZ ON\r\n", 9) && xbee_at_state == XAT_IDLE);
+    assert(xbee_at_queue("\r\nATCH 11\r\n", 11) && xbee_at_state == XAT_PENDING && !strcmp(xbee_at_cmd, "ATCH 11"));
+    assert(xbee_at_queue("ATID\r", 5) && !strcmp(xbee_at_cmd, "ATCH 11"));            /* busy: dropped */
+    uart2_log[0] = 0; xbee_at_run();                                                   /* RF change: early OK, then ATWR */
+    assert(!strcmp(uart2_log, "RESP|ATCH|OK|ACCEPTED\r\n+++ATCH 11\rATWR\rATCN\r") && xbee_at_state == XAT_IDLE);
+    assert(xbee_at_queue("ATVR\r", 5)); uart2_log[0] = 0; xbee_at_run();               /* query: no ATWR, value in RESP */
+    assert(!strcmp(uart2_log, "+++ATVR\rATCN\rRESP|ATVR|OK|3001\r\n"));
+    assert(xbee_at_queue("ATID\r", 5)); uart2_log[0] = 0; xbee_at_run();               /* RF register query: early reply, no ATWR (reference quirk) */
+    assert(!strcmp(uart2_log, "RESP|ATID|OK|ACCEPTED\r\n+++ATID\rATCN\r"));
+    xbee_sim = false;                                                                  /* module silent: abort, no ATCN */
+    assert(xbee_at_queue("ATWR\r", 5)); uart2_log[0] = 0; xbee_at_run();
+    assert(!strcmp(uart2_log, "+++RESP|ATWR|ERROR|NO_CMD_MODE\r\n") && xbee_at_state == XAT_IDLE);
     puts("telecommand ok");
     return 0;
 }

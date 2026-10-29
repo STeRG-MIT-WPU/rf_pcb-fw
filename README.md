@@ -55,7 +55,7 @@ module baud rates.
 |------------|--------------|-------|-----|
 | `fc_comms` | AboveNormal  | 4 KB  | parse FC lines into `FC_tlm`, queue `$IMG` lines, send telecommands and `IMGACK` to the FC |
 | `lora`     | Normal       | 4 KB  | telemetry every 3 s (240-byte chunk, 1 s gap, rest; ~1.2 s on air at 2.4 kbps, then listens for telecommands) |
-| `xbee`     | Normal       | 4 KB  | telemetry at 5 Hz, one image line in the spare time of each 200 ms slot (~5 KB/s) |
+| `xbee`     | Normal       | 4 KB  | telemetry at 5 Hz, one image line in the spare time of each 200 ms slot (~5 KB/s), XBee AT telecommands |
 | `gsm`      | BelowNormal  | 6 KB  | MQTT publish at 15 Hz, one image line per period, SMS with GNSS + mission time every 60 s, `+QMTRECV` and SMS (`+CMT`) telecommands, EC200U GNSS poll every 1 s |
 
 Tunables (periods, APN, broker, client id, topics, SMS number, ring sizes) are the `#define`s
@@ -107,6 +107,12 @@ forwarded to the FC one line at a time, following the FC's `TELECOMMAND_HANDOFF.
 - SMS: the modem delivers incoming texts directly (`AT+CNMI=2,2`); the first line of a text from
   `SMS_CMD_FROM` (defaults to `SMS_NUMBER`) is treated as a command, texts from other numbers are
   dropped. Acks for SMS commands still go to the MQTT ack topic.
+- XBee only: a line starting with `AT` (`ATCH 11`, `ATID`, `ATWR`, ...) configures the XBee itself
+  and is not sent to the FC. The xbee task pauses telemetry, waits 1.1 s, sends `+++`, the command,
+  `ATWR` if a value was set, then `ATCN`, and replies `RESP|<cmd>|OK/ERROR|<detail>` on XBee
+  (`ERROR` details: `NO_CMD_MODE`, `TIMEOUT`, `ATWR_FAIL`, `UART`). Commands that change the RF
+  link (`ATCH`, `ATID`, `ATDH`, `ATDL`, `ATZS`, `ATEE`, `ATEO`, `ATKY`) are answered `OK|ACCEPTED`
+  before they run; `ATFR` gets no reply. One command at a time, extras are dropped.
 - After `GYRO CAL` the RF board holds further commands for 13 s and after `SD CLEAR` for 3 s,
   because the FC's command task is blocked meanwhile. Queued commands go out afterwards in order.
 - The FC does not reply on USART3. The RF board publishes one ack per line on the MQTT ack topic:
